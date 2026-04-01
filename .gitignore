@@ -1,0 +1,19 @@
+# Data files (too large for git)
+*.csv
+processed/
+models/
+
+# Model artifacts
+*.tar.gz
+*.pt
+*.bin
+*.npy
+checkpoints/
+
+# AWS CLI installer (not needed in repo)
+AWSCLIV2.pkg
+
+# System / IDE
+.DS_Store
+__pycache__/
+*.pyc

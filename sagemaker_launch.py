@@ -196,7 +196,7 @@ def launch_reranker(bucket: str, session: sagemaker.Session, role: str = ROLE_AR
 # Job: Evaluation
 # ══════════════════════════════════════════════════════════════════════════════
 
-def launch_evaluation(bucket: str, session: sagemaker.Session, role: str = ROLE_ARN, budget: float = 50.0):
+def launch_evaluation(bucket: str, session: sagemaker.Session, role: str = ROLE_ARN, budget: float = 100.0, skip_tt_only: bool = False):
     """
     Runs inference.py --evaluate on the test split.
 
@@ -215,8 +215,9 @@ def launch_evaluation(bucket: str, session: sagemaker.Session, role: str = ROLE_
         framework_version=PYTORCH_VER,
         py_version=PY_VER,
         hyperparameters={
-            "evaluate": "",
-            "budget":   budget,
+            "evaluate":     "",
+            "budget":       budget,
+            **({"skip_tt_only": ""} if skip_tt_only else {}),
         },
         checkpoint_s3_uri=_bucket_uri(bucket, "checkpoints/evaluate"),
         checkpoint_local_path="/opt/ml/checkpoints",
@@ -304,7 +305,8 @@ def main():
                         choices=["all", "upload", "preprocess", "two_tower",
                                  "reranker", "evaluate", "cost"],
                         help="Which stage to run")
-    parser.add_argument("--budget",         type=float, default=50.0)
+    parser.add_argument("--budget",         type=float, default=100.0)
+    parser.add_argument("--skip_tt_only",   action="store_true",    help="Skip two-tower-only evaluation")
     parser.add_argument("--upload_raw",     action="store_true",    help="Upload raw CSVs to S3 first")
     args = parser.parse_args()
 
@@ -336,7 +338,7 @@ def main():
         launch_reranker(args.bucket, session, role)
 
     if args.stage in ("all", "evaluate"):
-        launch_evaluation(args.bucket, session, role, budget=args.budget)
+        launch_evaluation(args.bucket, session, role, budget=args.budget, skip_tt_only=args.skip_tt_only)
 
     print("\nAll requested jobs complete.")
 

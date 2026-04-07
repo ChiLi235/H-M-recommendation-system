@@ -7,7 +7,7 @@ End-to-end inference pipeline:
   3. Greedy knapsack      → select budget-feasible basket
 
 Usage:
-  python inference.py --budget 50 --customer_id <id>
+  python inference.py --budget 100 --customer_id <id>
 
   Or import recommend() for programmatic use.
 """
@@ -29,7 +29,9 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 DEVICE          = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 RETRIEVAL_TOP_K = 500   # Two-Tower retrieves this many candidates
 RERANK_BATCH    = 512   # batch size for reranker scoring
-MAX_SEQ_LEN     = 20
+MAX_SEQ_LEN_TT  = 20   # Two-Tower sequence length
+MAX_SEQ_LEN_RR  = 10   # Reranker sequence length (must match reranker_model.py MAX_SEQ_LEN)
+MAX_SEQ_LEN     = MAX_SEQ_LEN_TT  # default kept for backward compat
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -74,9 +76,9 @@ def _build_user_batch(
 ) -> dict:
     """Build a single-sample user input batch for the Two-Tower user tower."""
     def _pad_seq(lst):
-        lst = list(lst)[-MAX_SEQ_LEN:] if len(lst) > MAX_SEQ_LEN else list(lst)
-        ids  = torch.zeros(MAX_SEQ_LEN, dtype=torch.long)
-        mask = torch.zeros(MAX_SEQ_LEN, dtype=torch.bool)
+        lst = list(lst)[-MAX_SEQ_LEN_TT:] if len(lst) > MAX_SEQ_LEN_TT else list(lst)
+        ids  = torch.zeros(MAX_SEQ_LEN_TT, dtype=torch.long)
+        mask = torch.zeros(MAX_SEQ_LEN_TT, dtype=torch.bool)
         if lst:
             ids[:len(lst)]  = torch.tensor(lst, dtype=torch.long)
             mask[:len(lst)] = True
@@ -85,17 +87,31 @@ def _build_user_batch(
     seq_ids, seq_mask = _pad_seq(
         user_seq["seq_article_id_enc"] if user_seq is not None else []
     )
+    seq_ids = seq_ids.clamp(0, vocab_sizes["article_id_enc"])
+
+    art_max  = vocab_sizes["article_id_enc"]
+    age_max  = vocab_sizes["agebucket_enc"]
+    club_max = vocab_sizes["clubmemberstatus_enc"]
+    news_max = vocab_sizes["fashionnewsfrequency_enc"]
+
+    def _safe_int(row, key, default, max_val):
+        v = row.get(key, default)
+        return min(int(v) if (v is not None and v == v) else default, max_val)  # v==v guards NaN
+
+    def _safe_float(row, key, default):
+        v = row.get(key, default)
+        return float(v) if (v is not None and v == v) else default
 
     return {
-        "age_enc":  torch.tensor([int(customer_row.get("agebucket_enc", 0))],           dtype=torch.long),
-        "club_enc": torch.tensor([int(customer_row.get("clubmemberstatus_enc", 0))],     dtype=torch.long),
-        "news_enc": torch.tensor([int(customer_row.get("fashionnewsfrequency_enc", 0))], dtype=torch.long),
+        "age_enc":  torch.tensor([_safe_int(customer_row, "agebucket_enc",           0, age_max)],  dtype=torch.long),
+        "club_enc": torch.tensor([_safe_int(customer_row, "clubmemberstatus_enc",     0, club_max)], dtype=torch.long),
+        "news_enc": torch.tensor([_safe_int(customer_row, "fashionnewsfrequency_enc", 0, news_max)], dtype=torch.long),
         "user_num": torch.tensor([[
-            float(customer_row.get("user_total_purchases", 0)),
-            float(customer_row.get("user_avg_norm_price",  0)),
-            float(customer_row.get("user_purchase_freq",   0)),
-            float(customer_row.get("user_recency_days",  999)),
-            float(customer_row.get("user_preferred_channel", 0)),
+            _safe_float(customer_row, "user_total_purchases",  0.0),
+            _safe_float(customer_row, "user_avg_norm_price",   0.0),
+            _safe_float(customer_row, "user_purchase_freq",    0.0),
+            _safe_float(customer_row, "user_recency_days",   999.0),
+            _safe_float(customer_row, "user_preferred_channel", 0.0),
         ]], dtype=torch.float32),
         "seq_ids":  seq_ids.unsqueeze(0),   # (1, L)
         "seq_mask": seq_mask.unsqueeze(0),  # (1, L)
@@ -136,6 +152,7 @@ def _build_reranker_batch(
     art_features: pd.DataFrame,
     art_weekly: pd.DataFrame,
     year_week: str,
+    vocab_sizes: dict = None,
 ) -> dict:
     """Build a batch of (candidate × features) tensors for the reranker."""
     n = len(candidates)
@@ -148,12 +165,18 @@ def _build_reranker_batch(
             t[:len(lst)] = torch.tensor(lst, dtype=torch.long)
         return t
 
-    seq_ids = _pad_seq(user_seq["seq_article_id_enc"]  if user_seq is not None else [], MAX_SEQ_LEN)
-    seq_pt  = _pad_seq(user_seq["seq_producttype_enc"] if user_seq is not None else [], MAX_SEQ_LEN)
-    seq_col = _pad_seq(user_seq["seq_colourgroup_enc"] if user_seq is not None else [], MAX_SEQ_LEN)
+    seq_ids = _pad_seq(user_seq["seq_article_id_enc"]  if user_seq is not None else [], MAX_SEQ_LEN_RR)
+    seq_pt  = _pad_seq(user_seq["seq_producttype_enc"] if user_seq is not None else [], MAX_SEQ_LEN_RR)
+    seq_col = _pad_seq(user_seq["seq_colourgroup_enc"] if user_seq is not None else [], MAX_SEQ_LEN_RR)
     seq_len = int(user_seq["seq_len"]) if user_seq is not None else 0
-    seq_mask = torch.zeros(MAX_SEQ_LEN, dtype=torch.bool)
-    seq_mask[:min(seq_len, MAX_SEQ_LEN)] = True
+    seq_mask = torch.zeros(MAX_SEQ_LEN_RR, dtype=torch.bool)
+    seq_mask[:min(seq_len, MAX_SEQ_LEN_RR)] = True
+
+    # Clamp sequence IDs to valid embedding range
+    if vocab_sizes is not None:
+        seq_ids = seq_ids.clamp(0, vocab_sizes["article_id_enc"])
+        seq_pt  = seq_pt.clamp(0,  vocab_sizes["producttype_enc"])
+        seq_col = seq_col.clamp(0, vocab_sizes["colourgroup_enc"])
 
     # Expand sequence to (n, L)
     seq_ids_b  = seq_ids.unsqueeze(0).expand(n, -1)
@@ -170,10 +193,10 @@ def _build_reranker_batch(
         except (KeyError, TypeError):
             return float(default)
 
-    pt_encs  = [int(_get_art(a, "producttype_enc"))  for a in candidates]
-    ig_encs  = [int(_get_art(a, "indexgroup_enc"))   for a in candidates]
-    cg_encs  = [int(_get_art(a, "colourgroup_enc"))  for a in candidates]
-    gg_encs  = [int(_get_art(a, "garmentgroup_enc")) for a in candidates]
+    pt_encs  = [min(int(_get_art(a, "producttype_enc")),  vocab_sizes["producttype_enc"]  if vocab_sizes else 9999) for a in candidates]
+    ig_encs  = [min(int(_get_art(a, "indexgroup_enc")),   vocab_sizes["indexgroup_enc"]   if vocab_sizes else 9999) for a in candidates]
+    cg_encs  = [min(int(_get_art(a, "colourgroup_enc")),  vocab_sizes["colourgroup_enc"]  if vocab_sizes else 9999) for a in candidates]
+    gg_encs  = [min(int(_get_art(a, "garmentgroup_enc")), vocab_sizes["garmentgroup_enc"] if vocab_sizes else 9999) for a in candidates]
     avg_prices = [_get_art(a, "article_avg_norm_price") for a in candidates]
     log_sales  = [_get_art(a, "log_global_sales")       for a in candidates]
     ch1_ratio  = [_get_art(a, "article_channel1_ratio") for a in candidates]
@@ -189,19 +212,27 @@ def _build_reranker_batch(
     item_cat = torch.tensor(list(zip(pt_encs, ig_encs, cg_encs, gg_encs)), dtype=torch.long)
     item_num = torch.tensor(list(zip(avg_prices, log_sales, ch1_ratio, s4, s8)), dtype=torch.float32)
 
-    # User features (same for all candidates)
+    # User features (same for all candidates) — NaN-safe for cold-start users
+    def _si(key, default, max_val):
+        v = customer_row.get(key, default)
+        return min(int(v) if (v is not None and v == v) else default, max_val)
+
+    def _sf(key, default):
+        v = customer_row.get(key, default)
+        return float(v) if (v is not None and v == v) else default
+
     user_cat = torch.tensor([[
-        int(customer_row.get("agebucket_enc", 0)),
-        int(customer_row.get("clubmemberstatus_enc", 0)),
-        int(customer_row.get("fashionnewsfrequency_enc", 0)),
+        _si("agebucket_enc",           0, vocab_sizes["agebucket_enc"]           if vocab_sizes else 9999),
+        _si("clubmemberstatus_enc",     0, vocab_sizes["clubmemberstatus_enc"]     if vocab_sizes else 9999),
+        _si("fashionnewsfrequency_enc", 0, vocab_sizes["fashionnewsfrequency_enc"] if vocab_sizes else 9999),
     ]], dtype=torch.long).expand(n, -1)
 
     user_num_vals = [
-        float(customer_row.get("user_total_purchases", 0)),
-        float(customer_row.get("user_avg_norm_price",  0)),
-        float(customer_row.get("user_purchase_freq",   0)),
-        float(customer_row.get("user_recency_days",  999)),
-        float(customer_row.get("user_preferred_channel", 0)),
+        _sf("user_total_purchases",   0.0),
+        _sf("user_avg_norm_price",    0.0),
+        _sf("user_purchase_freq",     0.0),
+        _sf("user_recency_days",    999.0),
+        _sf("user_preferred_channel", 0.0),
     ]
     user_num = torch.tensor([user_num_vals], dtype=torch.float32).expand(n, -1)
 
@@ -245,13 +276,14 @@ def rerank_candidates(
     art_weekly: pd.DataFrame,
     year_week: str = None,
     batch_size: int = RERANK_BATCH,
+    vocab_sizes: dict = None,
 ) -> np.ndarray:
     """
     Score all candidates with SASRec reranker.
     Returns candidate article_id_enc array sorted by score descending.
     """
     batch = _build_reranker_batch(
-        customer_row, user_seq, candidates, art_features, art_weekly, year_week
+        customer_row, user_seq, candidates, art_features, art_weekly, year_week, vocab_sizes
     )
 
     scores = []
@@ -358,7 +390,7 @@ def recommend(
     # Stage 2: rerank
     ranked_arts, scores = rerank_candidates(
         reranker, customer_row, user_seq, candidates,
-        art_features, art_weekly, year_week,
+        art_features, art_weekly, year_week, vocab_sizes=vocab_sizes,
     )
 
     # Stage 3: knapsack
@@ -397,7 +429,7 @@ def evaluate_two_tower_only(
     user_seqs: pd.DataFrame,
     art_feat: pd.DataFrame,
     vocab_sizes: dict,
-    budget: float = 50.0,
+    budget: float = 100.0,
     top_k: int = 12,
 ):
     """Evaluate Two-Tower retrieval alone (no reranker)."""
@@ -456,7 +488,7 @@ def evaluate_two_tower_only(
     return metrics
 
 
-def evaluate_on_test(budget: float = 50.0):
+def evaluate_on_test(budget: float = 100.0, skip_tt_only: bool = False):
     """Run the full pipeline on the test split and report metrics."""
     from model_evaluate import evaluate_pipeline, print_metrics
 
@@ -474,6 +506,9 @@ def evaluate_on_test(budget: float = 50.0):
     user_seqs   = pd.read_parquet(f"{INPUT_DIR}/user_sequences.parquet")
     art_feat    = pd.read_parquet(f"{INPUT_DIR}/article_features.parquet")
     art_weekly  = pd.read_parquet(f"{INPUT_DIR}/article_weekly_stats.parquet")
+    if "article_id_enc" not in art_weekly.columns:
+        id_map = art_feat[["article_id", "article_id_enc"]].drop_duplicates()
+        art_weekly = art_weekly.merge(id_map, on="article_id", how="left")
 
     test_txn["date"] = pd.to_datetime(test_txn["date"])
     test_customers   = test_txn["customer_id"].unique().tolist()
@@ -493,13 +528,18 @@ def evaluate_on_test(budget: float = 50.0):
 
     print(f"Evaluating on {len(test_customers):,} test customers …")
 
+    # Pre-index for O(1) lookup — cold-start users simply won't appear in these dicts
+    uf_index  = uf_test.set_index("customer_id")
+    seq_index = user_seqs.set_index("customer_id") if "customer_id" in user_seqs.columns else user_seqs
+
     # ── Evaluation 1: Two-Tower only ─────────────────────────────────────────
-    print("\n--- Two-Tower Only ---")
-    tt_metrics = evaluate_two_tower_only(
-        two_tower, faiss_index, faiss_art_ids,
-        test_customers, test_txn, uf_test, user_seqs, art_feat,
-        vocab_sizes, budget=budget,
-    )
+    if not skip_tt_only:
+        print("\n--- Two-Tower Only ---")
+        tt_metrics = evaluate_two_tower_only(
+            two_tower, faiss_index, faiss_art_ids,
+            test_customers, test_txn, uf_test, user_seqs, art_feat,
+            vocab_sizes, budget=budget,
+        )
 
     # ── Evaluation 2: Two-Tower + Reranker ───────────────────────────────────
     print("\n--- Two-Tower + Reranker ---")
@@ -525,11 +565,9 @@ def evaluate_on_test(budget: float = 50.0):
         if i % 1000 == 0:
             print(f"  [Full pipeline] {i:,} / {len(test_customers):,}")
 
-        # Get user features
-        cust_row_df = uf_test[uf_test["customer_id"] == cust_id]
-        customer_row = cust_row_df.iloc[0] if not cust_row_df.empty else pd.Series(dtype=object)
-        seq_df = user_seqs[user_seqs["customer_id"] == cust_id]
-        user_seq = seq_df.iloc[0] if not seq_df.empty else None
+        # Get user features — returns empty Series / None for cold-start users
+        customer_row = uf_index.loc[cust_id] if cust_id in uf_index.index else pd.Series(dtype=object)
+        user_seq     = seq_index.loc[cust_id] if cust_id in seq_index.index else None
 
         # Stage 1: retrieve top-500
         candidates = retrieve_candidates(
@@ -540,7 +578,7 @@ def evaluate_on_test(budget: float = 50.0):
         # Stage 2: rerank all 500 candidates
         ranked_arts, scores = rerank_candidates(
             reranker, customer_row, user_seq, candidates,
-            art_feat, art_weekly, year_week=latest_week,
+            art_feat, art_weekly, year_week=latest_week, vocab_sizes=vocab_sizes,
         )
 
         # For metrics: use top-12 from reranked list (fair comparison with two-tower)
@@ -585,13 +623,14 @@ def evaluate_on_test(budget: float = 50.0):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--budget",      type=float, default=50.0, help="Budget in USD")
+    parser.add_argument("--budget",      type=float, default=100.0, help="Budget in USD")
     parser.add_argument("--customer_id", type=str,   default=None, help="Single customer to score")
     parser.add_argument("--evaluate",    action="store_true",      help="Run full test-set evaluation")
+    parser.add_argument("--skip_tt_only", action="store_true",     help="Skip two-tower-only evaluation")
     args = parser.parse_args()
 
     if args.evaluate:
-        evaluate_on_test(budget=args.budget)
+        evaluate_on_test(budget=args.budget, skip_tt_only=args.skip_tt_only)
         return
 
     if args.customer_id:
@@ -607,6 +646,9 @@ def main():
         user_seqs = pd.read_parquet(f"{INPUT_DIR}/user_sequences.parquet")
         art_feat  = pd.read_parquet(f"{INPUT_DIR}/article_features.parquet")
         art_weekly = pd.read_parquet(f"{INPUT_DIR}/article_weekly_stats.parquet")
+        if "article_id_enc" not in art_weekly.columns:
+            id_map = art_feat[["article_id", "article_id_enc"]].drop_duplicates()
+            art_weekly = art_weekly.merge(id_map, on="article_id", how="left")
 
         result = recommend(
             customer_id=args.customer_id,
@@ -630,8 +672,8 @@ def main():
                   f"${r['estimated_price_usd']:>7.2f}  {r['prod_name'][:40]}")
         print(f"\nBasket total: ${total:.2f} / ${args.budget:.2f}")
     else:
-        print("Usage: python inference.py --customer_id <id> --budget 50")
-        print("       python inference.py --evaluate --budget 50")
+        print("Usage: python inference.py --customer_id <id> --budget 100")
+        print("       python inference.py --evaluate --budget 100")
 
 
 if __name__ == "__main__":

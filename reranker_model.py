@@ -32,18 +32,18 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
-SEQ_EMB_DIM  = 64    # article_id embedding dim in sequence
-CAT_EMB_DIM  = 16    # dim for product_type / colour in sequence
-ITEM_EMB_DIM = 24    # dim for candidate item categoricals
-USER_EMB_DIM = 16    # dim for user demographic categoricals
-MAX_SEQ_LEN  = 20
+SEQ_EMB_DIM  = 32    # article_id embedding dim in sequence
+CAT_EMB_DIM  = 8     # dim for product_t ype / colour in sequence
+ITEM_EMB_DIM = 16    # dim for candidate item categoricals
+USER_EMB_DIM = 8     # dim for user demographic categoricals
+MAX_SEQ_LEN  = 10
 N_HEADS      = 2
-HIDDEN       = 256
-DROPOUT      = 0.1
+HIDDEN       = 64
+DROPOUT      = 0.5
 BATCH_SIZE   = 256
 EPOCHS       = 10
 LR           = 1e-3
-WEIGHT_DECAY = 1e-4
+WEIGHT_DECAY = 1e-3
 NUM_WORKERS  = 4
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -73,7 +73,8 @@ class RerankerDataset(Dataset):
         "user_ever_bought_article", "user_affinity_prodtype", "user_price_fit",
     ]
 
-    def __init__(self, parquet_path: str):
+    def __init__(self, parquet_path: str, is_train: bool = False):
+        self.is_train = is_train
         self.df = pd.read_parquet(parquet_path)
         # fill any missing numeric columns
         for col in self.ITEM_NUM_COLS + self.USER_NUM_COLS + self.CROSS_COLS:
@@ -87,74 +88,105 @@ class RerankerDataset(Dataset):
         for col in self.SEQ_COLS:
             if col not in self.df.columns:
                 self.df[col] = [[] for _ in range(len(self.df))]
+        if "sample_weight" not in self.df.columns:
+            self.df["sample_weight"] = 1.0
 
         print(f"  RerankerDataset: {len(self.df):,} rows  "
               f"pos={self.df['label'].sum():,}  "
               f"neg={(self.df['label']==0).sum():,}")
 
+        # ── pre-convert to numpy for fast __getitem__ indexing ─────────────────
+        self.np_label         = self.df["label"].values.astype("float32")
+        self.np_sample_weight = self.df["sample_weight"].values.astype("float32")
+        self.np_seq_len       = self.df["seq_len"].values.astype("int32")
+
+        # sequence columns: object array of variable-length lists/arrays
+        self.np_seq_ids = self.df["seq_article_id_enc"].values
+        self.np_seq_pt  = self.df["seq_producttype_enc"].values
+        self.np_seq_col = self.df["seq_colourgroup_enc"].values
+
+        # item categoricals: (N, 4) int array
+        for col in ["producttype_enc", "indexgroup_enc", "colourgroup_enc", "garmentgroup_enc"]:
+            if col not in self.df.columns:
+                self.df[col] = 0
+        self.np_item_cat = self.df[
+            ["producttype_enc", "indexgroup_enc", "colourgroup_enc", "garmentgroup_enc"]
+        ].values.astype("int64")
+
+        # item numerics: (N, 5) float array
+        self.np_item_num = self.df[self.ITEM_NUM_COLS].values.astype("float32")
+
+        # user categoricals: (N, 3) int array
+        for col in ["agebucket_enc", "clubmemberstatus_enc", "fashionnewsfrequency_enc"]:
+            if col not in self.df.columns:
+                self.df[col] = 0
+        self.np_user_cat = self.df[
+            ["agebucket_enc", "clubmemberstatus_enc", "fashionnewsfrequency_enc"]
+        ].values.astype("int64")
+
+        # user numerics: (N, 5) float array
+        self.np_user_num = self.df[self.USER_NUM_COLS].values.astype("float32")
+
+        # cross features: (N, 3) float array
+        self.np_cross = self.df[self.CROSS_COLS].values.astype("float32")
+
+        # drop df to free memory — all data is now in numpy arrays
+        del self.df
+
     def __len__(self):
-        return len(self.df)
+        return len(self.np_label)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-
-        label = torch.tensor(float(row["label"]), dtype=torch.float32)
+        label = torch.tensor(self.np_label[idx], dtype=torch.float32)
 
         # ── sequence ──────────────────────────────────────────────────────────
-        def _pad_seq(lst, maxlen):
-            lst = list(lst)[-maxlen:] if len(lst) > maxlen else list(lst)
+        def _pad_seq(arr, maxlen):
+            arr = arr[-maxlen:] if len(arr) > maxlen else arr
             t = torch.zeros(maxlen, dtype=torch.long)
-            if lst:
-                t[:len(lst)] = torch.tensor(lst, dtype=torch.long)
+            if len(arr) > 0:
+                t[:len(arr)] = torch.tensor(arr, dtype=torch.long)
             return t
 
-        seq_ids  = _pad_seq(row["seq_article_id_enc"],  MAX_SEQ_LEN)
-        seq_pt   = _pad_seq(row["seq_producttype_enc"], MAX_SEQ_LEN)
-        seq_col  = _pad_seq(row["seq_colourgroup_enc"], MAX_SEQ_LEN)
+        seq_ids = _pad_seq(self.np_seq_ids[idx], MAX_SEQ_LEN)
+        seq_pt  = _pad_seq(self.np_seq_pt[idx],  MAX_SEQ_LEN)
+        seq_col = _pad_seq(self.np_seq_col[idx],  MAX_SEQ_LEN)
 
-        seq_len  = min(int(row["seq_len"]), MAX_SEQ_LEN)
+        # sequence masking: randomly zero out 15% of tokens during training
+        if self.is_train:
+            mask = torch.rand(MAX_SEQ_LEN) < 0.15
+            seq_ids[mask] = 0
+            seq_pt[mask]  = 0
+            seq_col[mask] = 0
+
+        seq_len  = min(int(self.np_seq_len[idx]), MAX_SEQ_LEN)
         seq_mask = torch.zeros(MAX_SEQ_LEN, dtype=torch.bool)
         seq_mask[:seq_len] = True
 
         # ── candidate item ────────────────────────────────────────────────────
-        item_cat = torch.tensor([
-            int(row.get("producttype_enc",  0)),
-            int(row.get("indexgroup_enc",   0)),
-            int(row.get("colourgroup_enc",  0)),
-            int(row.get("garmentgroup_enc", 0)),
-        ], dtype=torch.long)
-
-        item_num = torch.nan_to_num(torch.tensor(
-            [float(row[c]) for c in self.ITEM_NUM_COLS], dtype=torch.float32
-        ), nan=0.0)
+        item_cat = torch.tensor(self.np_item_cat[idx], dtype=torch.long)
+        item_num = torch.nan_to_num(torch.tensor(self.np_item_num[idx], dtype=torch.float32), nan=0.0)
 
         # ── user demographics ─────────────────────────────────────────────────
-        user_cat = torch.tensor([
-            int(row.get("agebucket_enc",           0)),
-            int(row.get("clubmemberstatus_enc",     0)),
-            int(row.get("fashionnewsfrequency_enc", 0)),
-        ], dtype=torch.long)
-
-        user_num = torch.nan_to_num(torch.tensor(
-            [float(row[c]) for c in self.USER_NUM_COLS], dtype=torch.float32
-        ), nan=0.0)
+        user_cat = torch.tensor(self.np_user_cat[idx], dtype=torch.long)
+        user_num = torch.nan_to_num(torch.tensor(self.np_user_num[idx], dtype=torch.float32), nan=0.0)
 
         # ── cross features ────────────────────────────────────────────────────
-        cross = torch.nan_to_num(torch.tensor(
-            [float(row[c]) for c in self.CROSS_COLS], dtype=torch.float32
-        ), nan=0.0)
+        cross = torch.nan_to_num(torch.tensor(self.np_cross[idx], dtype=torch.float32), nan=0.0)
+
+        sample_weight = torch.tensor(self.np_sample_weight[idx], dtype=torch.float32)
 
         return {
-            "seq_ids":  seq_ids,
-            "seq_pt":   seq_pt,
-            "seq_col":  seq_col,
-            "seq_mask": seq_mask,
-            "item_cat": item_cat,
-            "item_num": item_num,
-            "user_cat": user_cat,
-            "user_num": user_num,
-            "cross":    cross,
-            "label":    label,
+            "seq_ids":       seq_ids,
+            "seq_pt":        seq_pt,
+            "seq_col":       seq_col,
+            "seq_mask":      seq_mask,
+            "item_cat":      item_cat,
+            "item_num":      item_num,
+            "user_cat":      user_cat,
+            "user_num":      user_num,
+            "cross":         cross,
+            "label":         label,
+            "sample_weight": sample_weight,
         }
 
 
@@ -166,7 +198,7 @@ class SASRecReranker(nn.Module):
     """
     Self-attentive sequential reranker.
 
-    seq_dim  = SEQ_EMB_DIM + CAT_EMB_DIM + CAT_EMB_DIM = 64 + 16 + 16 = 96
+    seq_dim  = SEQ_EMB_DIM + CAT_EMB_DIM + CAT_EMB_DIM = 32 + 8 + 8 = 48
     cand_dim = 4 * ITEM_EMB_DIM + 5 (numerics)
     user_dim = 3 * USER_EMB_DIM + 5 (numerics)
     cross_dim = 3
@@ -220,9 +252,9 @@ class SASRecReranker(nn.Module):
             nn.Linear(mlp_in, HIDDEN),
             nn.ReLU(),
             nn.Dropout(DROPOUT),
-            nn.Linear(HIDDEN, 64),
+            nn.Linear(HIDDEN, 32),
             nn.ReLU(),
-            nn.Linear(64, 1),
+            nn.Linear(32, 1),
         )
 
     def _encode_sequence(self, seq_ids, seq_pt, seq_col, seq_mask):
@@ -309,8 +341,10 @@ def train(
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
 
-    best_val_loss = float("inf")
-    start_epoch   = 1
+    best_val_loss     = float("inf")
+    start_epoch       = 1
+    patience          = 3
+    epochs_no_improve = 0
 
     # ── resume from spot checkpoint if available ───────────────────────────────
     resume_path = os.path.join(CHECKPOINT_DIR, "reranker_resume.pt")
@@ -320,8 +354,9 @@ def train(
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
-        start_epoch   = ckpt["epoch"] + 1
-        best_val_loss = ckpt["best_val_loss"]
+        start_epoch       = ckpt["epoch"] + 1
+        best_val_loss     = ckpt["best_val_loss"]
+        epochs_no_improve = ckpt.get("epochs_no_improve", 0)
         print(f"  Resumed at epoch {start_epoch}  best_val_loss={best_val_loss:.4f}")
 
     for epoch in range(start_epoch, epochs + 1):
@@ -331,9 +366,14 @@ def train(
         for batch in train_loader:
             batch = {k: v.to(DEVICE) for k, v in batch.items()}
             logits = model(batch)
-            loss = F.binary_cross_entropy_with_logits(logits, batch["label"])
+            # per-sample weighted loss: reduction='none' gives (B,), then weight and mean
+            loss_per_sample = F.binary_cross_entropy_with_logits(
+                logits, batch["label"], reduction="none"
+            )
+            loss = (loss_per_sample * batch["sample_weight"]).mean()
             if torch.isnan(loss) or torch.isinf(loss):
-                continue  # skip bad batch
+                print(f"  WARNING: NaN/inf train loss at epoch {epoch}, skipping batch")
+                continue
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -354,6 +394,8 @@ def train(
                 if not (torch.isnan(bloss) or torch.isinf(bloss)):
                     val_loss += bloss.item()
                     val_batches += 1
+        if val_batches == 0:
+            print(f"  WARNING: all val batches produced NaN/inf — val_loss unreliable")
         val_loss /= max(val_batches, 1)
 
         scheduler.step()
@@ -362,16 +404,23 @@ def train(
         # ── save best model weights ────────────────────────────────────────────
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            epochs_no_improve = 0
             torch.save(model.state_dict(), os.path.join(MODEL_DIR, "reranker_best.pt"))
             print(f"    ✓ best model saved  (val_loss={val_loss:.4f})")
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f"  Early stopping at epoch {epoch} (no improvement for {patience} epochs)")
+                break
 
         # ── save spot resume checkpoint every epoch ────────────────────────────
         torch.save({
-            "epoch":         epoch,
-            "model":         model.state_dict(),
-            "optimizer":     optimizer.state_dict(),
-            "scheduler":     scheduler.state_dict(),
-            "best_val_loss": best_val_loss,
+            "epoch":            epoch,
+            "model":            model.state_dict(),
+            "optimizer":        optimizer.state_dict(),
+            "scheduler":        scheduler.state_dict(),
+            "best_val_loss":    best_val_loss,
+            "epochs_no_improve": epochs_no_improve,
         }, resume_path)
 
     print(f"Training complete. Best val_loss={best_val_loss:.4f}")
@@ -396,8 +445,8 @@ def main():
     vocab_sizes = encoders["_vocab_sizes"]
 
     print("Loading datasets …")
-    train_ds = RerankerDataset(f"{INPUT_DIR}/reranker_train.parquet")
-    val_ds   = RerankerDataset(f"{INPUT_DIR}/reranker_val.parquet")
+    train_ds = RerankerDataset(f"{INPUT_DIR}/reranker_train.parquet", is_train=True)
+    val_ds   = RerankerDataset(f"{INPUT_DIR}/reranker_val.parquet",   is_train=False)
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,

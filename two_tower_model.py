@@ -24,9 +24,9 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 INPUT_DIR      = os.environ.get("SM_CHANNEL_PROCESSED", "processed")
 OUTPUT_DIR     = os.environ.get("SM_OUTPUT_DATA_DIR", "processed")
@@ -42,8 +42,8 @@ OUTPUT_DIM  = 128
 MAX_SEQ_LEN = 20
 BATCH_SIZE  = 1024
 EPOCHS      = 15
-LR          = 1e-3
-TEMPERATURE = 0.07
+LR          = 3e-4
+TEMPERATURE = 0.1
 NUM_WORKERS = 4
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -63,6 +63,10 @@ class TwoTowerDataset(Dataset):
     def __init__(self, parquet_path: str):
         self.df = pd.read_parquet(parquet_path)
         self._validate()
+        # sample_weight added by sliding window builder; default 1.0 for val/test
+        if "sample_weight" not in self.df.columns:
+            self.df["sample_weight"] = 1.0
+        self.weights = self.df["sample_weight"].values.astype("float32")
 
     def _validate(self):
         required = [
@@ -157,7 +161,7 @@ class UserTower(nn.Module):
             nn.Linear(in_dim, hidden),
             nn.ReLU(),
             nn.LayerNorm(hidden),
-            nn.Dropout(0.1),
+            nn.Dropout(0.3),
             nn.Linear(hidden, out_dim),
         )
 
@@ -191,7 +195,7 @@ class ItemTower(nn.Module):
             nn.Linear(in_dim, hidden),
             nn.ReLU(),
             nn.LayerNorm(hidden),
-            nn.Dropout(0.1),
+            nn.Dropout(0.3),
             nn.Linear(hidden, out_dim),
         )
 
@@ -256,11 +260,15 @@ def train(
     lr: float = LR,
 ):
     model.to(DEVICE)
-    optimizer = Adam(model.parameters(), lr=lr)
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
+    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    warmup    = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=2)
+    cosine    = CosineAnnealingLR(optimizer, T_max=epochs - 2)
+    scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[2])
 
     best_val_loss = float("inf")
     start_epoch   = 1
+    patience      = 3
+    epochs_no_improve = 0
 
     # ── resume from spot checkpoint if available ───────────────────────────────
     resume_path = os.path.join(CHECKPOINT_DIR, "two_tower_resume.pt")
@@ -310,8 +318,14 @@ def train(
         # ── save best model weights ────────────────────────────────────────────
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            epochs_no_improve = 0
             torch.save(model.state_dict(), os.path.join(MODEL_DIR, "two_tower_best.pt"))
             print(f"    ✓ best model saved  (val_loss={val_loss:.4f})")
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f"  Early stopping at epoch {epoch} (no improvement for {patience} epochs)")
+                break
 
         # ── save spot resume checkpoint every epoch ────────────────────────────
         torch.save({
@@ -404,8 +418,13 @@ def main():
     train_ds = TwoTowerDataset(f"{INPUT_DIR}/two_tower_train.parquet")
     val_ds   = TwoTowerDataset(f"{INPUT_DIR}/two_tower_val.parquet")
 
+    sampler = WeightedRandomSampler(
+        weights=train_ds.weights,
+        num_samples=len(train_ds),
+        replacement=True,
+    )
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
+        train_ds, batch_size=args.batch_size, sampler=sampler,
         num_workers=NUM_WORKERS, pin_memory=True,
     )
     val_loader = DataLoader(
@@ -425,7 +444,11 @@ def main():
     model = train(model, train_loader, val_loader, epochs=args.epochs, lr=args.lr)
 
     # load best checkpoint
-    model.load_state_dict(torch.load(os.path.join(MODEL_DIR, "two_tower_best.pt")))
+    best_path = os.path.join(MODEL_DIR, "two_tower_best.pt")
+    if os.path.exists(best_path):
+        model.load_state_dict(torch.load(best_path))
+    else:
+        print("WARNING: two_tower_best.pt not found, saving current model state")
 
     # ── save final model ──────────────────────────────────────────────────────
     torch.save(model.state_dict(), os.path.join(MODEL_DIR, "two_tower_final.pt"))

@@ -27,6 +27,13 @@ POP_POOL_SIZE  = 200  # top-K popular articles per week used as negative pool
 MAX_SEQ_LEN    = 20
 RANDOM_SEED    = 42
 
+# ── sliding window config ──────────────────────────────────────────────────────
+WINDOW_WEEKS   = 8    # weeks of history used as training context per window
+STEP_WEEKS     = 2    # weeks to slide the window forward each step
+TARGET_WEEKS   = 2    # weeks ahead to predict (label period)
+ALIVE_DAYS     = 14   # item must have been purchased within last N days of window
+DECAY_BASE     = 0.85 # time-decay weight base: most recent window = 1.0, older = decay^k
+
 
 def _build_week_cutoff_map(year_weeks) -> dict:
     """Pre-compute year_week string → Monday pd.Timestamp for all unique weeks."""
@@ -92,6 +99,34 @@ def _sel(df, cols):
 # 1. Two-Tower dataset  (positive pairs only)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _generate_windows(txn: pd.DataFrame):
+    """
+    Generate (w_start, w_end, t_end, weight) tuples across the full txn period.
+    Most recent window gets weight=1.0, older windows decay by DECAY_BASE^k.
+    """
+    period_start = txn["date"].min()
+    period_end   = txn["date"].max()
+    window_size  = pd.Timedelta(weeks=WINDOW_WEEKS)
+    target_size  = pd.Timedelta(weeks=TARGET_WEEKS)
+    step_size    = pd.Timedelta(weeks=STEP_WEEKS)
+
+    raw = []
+    ws = period_start + window_size
+    while ws + target_size <= period_end + pd.Timedelta(days=1):
+        raw.append((ws - window_size, ws, ws + target_size))
+        ws += step_size
+
+    n = len(raw)
+    return [(w_start, w_end, t_end, DECAY_BASE ** (n - 1 - i))
+            for i, (w_start, w_end, t_end) in enumerate(raw)]
+
+
+def _alive_articles(txn: pd.DataFrame, window_end: pd.Timestamp, alive_days: int) -> set:
+    """Return set of article_id_enc purchased within alive_days before window_end."""
+    cutoff = window_end - pd.Timedelta(days=alive_days)
+    return set(txn[(txn["date"] >= cutoff) & (txn["date"] < window_end)]["article_id_enc"].unique())
+
+
 def build_two_tower_dataset(
     txn: pd.DataFrame,
     user_features: pd.DataFrame,
@@ -100,52 +135,119 @@ def build_two_tower_dataset(
     split_name: str,
 ) -> pd.DataFrame:
     """
-    One row per positive purchase.
-    User features, article features, and purchase sequences are pre-joined.
-    In-batch negatives are generated at training time in the DataLoader.
-    """
-    print(f"Building two-tower {split_name} …")
+    Sliding-window rolling origin dataset.
 
+    For each window position across the full transaction period:
+      - context window : [window_start, window_end)   — WINDOW_WEEKS of history
+      - target window  : [window_end,   target_end)   — TARGET_WEEKS ahead (label period)
+
+    Positives are purchases in the target window. User sequences are built from
+    the context window only (no leakage). Items not purchased in the last
+    ALIVE_DAYS of the context window are filtered out (dead stock removal).
+
+    Each row gets a sample_weight: most recent window = 1.0, older windows
+    decay by DECAY_BASE^k so the model focuses on recent seasonal patterns.
+    """
+    if split_name != "train":
+        # Val/test use the original static approach — no sliding needed
+        print(f"Building two-tower {split_name} (static) …")
+        art_sel  = _sel(art_features, ARTICLE_FEAT_COLS)
+        user_sel = _sel(user_features, USER_FEAT_COLS)
+        df = txn[["customer_id", "article_id", "article_id_enc", "year_week"]].copy()
+        df = df.merge(user_sel, on="customer_id", how="inner")
+        df = df.merge(art_sel,  on="article_id_enc", how="inner")
+        seq_cols = ["customer_id", "seq_article_id_enc", "seq_dates", "seq_len"]
+        df = df.merge(user_seqs[seq_cols], on="customer_id", how="left")
+        df["seq_len"] = df["seq_len"].fillna(0).astype(int)
+        for col in ["seq_article_id_enc", "seq_dates"]:
+            df[col] = df[col].apply(lambda x: x if isinstance(x, (list, np.ndarray)) else [])
+        week_cutoffs = _build_week_cutoff_map(df["year_week"].unique())
+        new_seqs, new_lens = [], []
+        for seq_ids, seq_dates, yw in zip(df["seq_article_id_enc"], df["seq_dates"], df["year_week"]):
+            cutoff = week_cutoffs[yw]
+            if len(seq_ids) > 0 and len(seq_dates) > 0:
+                filtered = [s for s, d in zip(seq_ids, seq_dates) if d < cutoff][-MAX_SEQ_LEN:]
+                new_seqs.append(filtered); new_lens.append(len(filtered))
+            else:
+                new_seqs.append([]); new_lens.append(0)
+        df["seq_article_id_enc"] = new_seqs
+        df["seq_len"] = new_lens
+        df = df.drop(columns=["seq_dates"])
+        df["sample_weight"] = 1.0
+        _fill_num_cols(df)
+        print(f"  {len(df):,} positive pairs  ({df['customer_id'].nunique():,} customers)")
+        return df
+
+    print(f"Building two-tower {split_name} (sliding window) …")
     art_sel  = _sel(art_features, ARTICLE_FEAT_COLS)
     user_sel = _sel(user_features, USER_FEAT_COLS)
 
-    df = txn[["customer_id", "article_id", "article_id_enc", "year_week"]].copy()
-    df = df.merge(user_sel, on="customer_id", how="inner")
-    df = df.merge(art_sel,  on="article_id_enc", how="inner")
+    txn = txn.copy()
+    txn["date"] = pd.to_datetime(txn["date"])
 
-    # Join user sequences (only article_id_enc sequence needed for user tower)
+    windows = _generate_windows(txn)
+    if not windows:
+        raise ValueError("No sliding windows generated — check transaction date range and WINDOW_WEEKS")
+    print(f"  {len(windows)} windows  "
+          f"({windows[0][0].date()} → {windows[-1][2].date()})  "
+          f"window={WINDOW_WEEKS}w  step={STEP_WEEKS}w  target={TARGET_WEEKS}w")
+
     seq_cols = ["customer_id", "seq_article_id_enc", "seq_dates", "seq_len"]
-    df = df.merge(user_seqs[seq_cols], on="customer_id", how="left")
-    df["seq_len"] = df["seq_len"].fillna(0).astype(int)
-    df["seq_article_id_enc"] = df["seq_article_id_enc"].apply(
-        lambda x: x if isinstance(x, (list, np.ndarray)) else []
-    )
-    df["seq_dates"] = df["seq_dates"].apply(
-        lambda x: x if isinstance(x, (list, np.ndarray)) else []
-    )
+    seq_df = user_seqs[seq_cols].copy()
+    for col in ["seq_article_id_enc", "seq_dates"]:
+        seq_df[col] = seq_df[col].apply(lambda x: x if isinstance(x, (list, np.ndarray)) else [])
 
-    # Temporal filtering: only keep sequence items purchased before the target week
-    print(f"  Filtering sequences by temporal cutoff …")
-    week_cutoffs = _build_week_cutoff_map(df["year_week"].unique())
-    new_seqs = []
-    new_lens = []
-    for seq_ids, seq_dates, yw in zip(
-        df["seq_article_id_enc"], df["seq_dates"], df["year_week"]
-    ):
-        cutoff = week_cutoffs[yw]
-        if len(seq_ids) > 0 and len(seq_dates) > 0:
-            filtered = [sid for sid, d in zip(seq_ids, seq_dates) if d < cutoff]
-            filtered = filtered[-MAX_SEQ_LEN:]
-            new_seqs.append(filtered)
-            new_lens.append(len(filtered))
-        else:
-            new_seqs.append([])
-            new_lens.append(0)
-    df["seq_article_id_enc"] = new_seqs
-    df["seq_len"] = new_lens
-    df = df.drop(columns=["seq_dates"])
+    window_dfs = []
+    for w_start, w_end, t_end, weight in windows:
 
-    # fill NaN in all numeric columns — prevents NaN loss in training
+        # alive items: must have been purchased in last ALIVE_DAYS of context window
+        alive = _alive_articles(txn, w_end, ALIVE_DAYS)
+        if not alive:
+            continue
+
+        # positives: purchases in the target window, only alive items
+        target_txn = txn[(txn["date"] >= w_end) & (txn["date"] < t_end)].copy()
+        target_txn = target_txn[target_txn["article_id_enc"].isin(alive)]
+        if target_txn.empty:
+            continue
+
+        df = target_txn[["customer_id", "article_id", "article_id_enc", "year_week"]].copy()
+        df = df.merge(user_sel,  on="customer_id",   how="inner")
+        df = df.merge(art_sel,   on="article_id_enc", how="inner")
+        df = df.merge(seq_df,    on="customer_id",    how="left")
+        df["seq_len"] = df["seq_len"].fillna(0).astype(int)
+
+        # filter sequences: only items from context window (before w_end)
+        new_seqs, new_lens = [], []
+        for seq_ids, seq_dates in zip(df["seq_article_id_enc"], df["seq_dates"]):
+            if len(seq_ids) > 0 and len(seq_dates) > 0:
+                filtered = [s for s, d in zip(seq_ids, seq_dates)
+                            if pd.Timestamp(d) >= w_start and pd.Timestamp(d) < w_end]
+                filtered = filtered[-MAX_SEQ_LEN:]
+                new_seqs.append(filtered); new_lens.append(len(filtered))
+            else:
+                new_seqs.append([]); new_lens.append(0)
+        df["seq_article_id_enc"] = new_seqs
+        df["seq_len"] = new_lens
+        df = df.drop(columns=["seq_dates"])
+        df["sample_weight"] = weight
+
+        window_dfs.append(df)
+
+    if not window_dfs:
+        raise ValueError("All sliding windows produced empty datasets")
+
+    result = pd.concat(window_dfs, ignore_index=True)
+    _fill_num_cols(result)
+
+    weights = result.groupby(lambda _: True)["sample_weight"].mean().iloc[0]
+    print(f"  {len(result):,} positive pairs across {len(window_dfs)} windows  "
+          f"(avg decay weight={weights:.3f})")
+    return result
+
+
+def _fill_num_cols(df: pd.DataFrame) -> None:
+    """Fill NaN in numeric feature columns in-place."""
     num_cols = [
         "customer_id_enc", "agebucket_enc", "clubmemberstatus_enc",
         "fashionnewsfrequency_enc", "user_total_purchases", "user_avg_norm_price",
@@ -157,9 +259,6 @@ def build_two_tower_dataset(
     for col in num_cols:
         if col in df.columns:
             df[col] = df[col].fillna(0)
-
-    print(f"  {len(df):,} positive pairs  ({df['customer_id'].nunique():,} customers)")
-    return df
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -179,6 +278,38 @@ def _week_popular_pool(txn: pd.DataFrame, pool_size: int) -> pd.DataFrame:
         .astype(int)
     )
     return counts[counts["week_rank"] <= pool_size][["year_week", "article_id_enc"]]
+
+
+def _mine_hard_negatives_from_pool(
+    pos: pd.DataFrame,
+    pool: np.ndarray,
+    n_neg: int,
+) -> pd.DataFrame:
+    """
+    Per-window negative sampler: samples n_neg negatives per customer
+    directly from a flat pool array (alive articles), with no year_week lookup.
+    Used inside the sliding window loop where pool = alive article IDs.
+    """
+    if len(pool) == 0:
+        return pd.DataFrame(columns=["customer_id", "article_id_enc", "year_week", "label"])
+
+    bought   = set(zip(pos["customer_id"], pos["article_id_enc"]))
+    cust_yw  = pos.drop_duplicates("customer_id").set_index("customer_id")["year_week"]
+    custs    = pos["customer_id"].unique()
+    sampled_idx  = rng.integers(0, len(pool), size=(len(custs), n_neg))
+    sampled_arts = pool[sampled_idx]   # (n_cust, n_neg)
+
+    rows = []
+    for cust, arts in zip(custs, sampled_arts):
+        yw = cust_yw[cust]
+        for art in arts:
+            if (cust, int(art)) not in bought:
+                rows.append({"customer_id": cust, "article_id_enc": int(art),
+                             "year_week": yw, "label": 0})
+
+    if not rows:
+        return pd.DataFrame(columns=["customer_id", "article_id_enc", "year_week", "label"])
+    return pd.DataFrame(rows).drop_duplicates(["customer_id", "article_id_enc"])
 
 
 def _mine_hard_negatives(
@@ -251,27 +382,60 @@ def build_reranker_dataset(
     split_name: str,
 ) -> pd.DataFrame:
     """
-    Builds (customer, candidate_article, label) rows with full features:
-      - user demographics + behaviour
-      - article metadata + weekly popularity stats
-      - user purchase sequence (for SASRec attention)
-      - cross features: ever_bought, affinity_prodtype, price_fit
+    Builds (customer, candidate_article, label) rows with full features.
+
+    For train: uses the same sliding window approach as the Two-Tower dataset.
+      - Hard negatives are mined per window from alive items only (no dead stock)
+      - sample_weight assigned by time-decay so recent windows matter more
+    For val: static approach (full val period, no windowing needed)
     """
     print(f"Building reranker {split_name} …")
 
     art_sel  = _sel(art_features, ARTICLE_FEAT_COLS)
     user_sel = _sel(user_features, USER_FEAT_COLS)
 
-    # Positives
-    pos = txn[["customer_id", "article_id_enc", "year_week"]].copy()
-    pos["label"] = 1
-    print(f"  {len(pos):,} positives")
+    if split_name != "train":
+        # static val/test: use full txn as-is
+        pos = txn[["customer_id", "article_id_enc", "year_week"]].copy()
+        pos["label"] = 1
+        pos["sample_weight"] = 1.0
+        print(f"  {len(pos):,} positives")
+        pop_pool = _week_popular_pool(txn, POP_POOL_SIZE)
+        neg = _mine_hard_negatives(pos, pop_pool, N_NEG_RERANKER)
+        neg["sample_weight"] = 1.0
+        all_rows = pd.concat([pos, neg], ignore_index=True)
+    else:
+        # sliding window train: mine positives + negatives per window
+        txn = txn.copy()
+        txn["date"] = pd.to_datetime(txn["date"])
+        windows = _generate_windows(txn)
+        if not windows:
+            raise ValueError("No sliding windows generated for reranker")
+        print(f"  {len(windows)} windows  window={WINDOW_WEEKS}w  step={STEP_WEEKS}w  target={TARGET_WEEKS}w")
 
-    # Hard negatives
-    pop_pool = _week_popular_pool(txn, POP_POOL_SIZE)
-    neg = _mine_hard_negatives(pos, pop_pool, N_NEG_RERANKER)
+        window_dfs = []
+        for w_start, w_end, t_end, weight in windows:
+            alive = _alive_articles(txn, w_end, ALIVE_DAYS)
+            if not alive:
+                continue
+            # positives from target window, alive items only
+            target_txn = txn[(txn["date"] >= w_end) & (txn["date"] < t_end)]
+            target_txn = target_txn[target_txn["article_id_enc"].isin(alive)]
+            if target_txn.empty:
+                continue
+            pos_w = target_txn[["customer_id", "article_id_enc", "year_week"]].copy()
+            pos_w["label"] = 1
+            pos_w["sample_weight"] = weight
+            # sample negatives directly from alive pool — no year_week mismatch
+            alive_arr = np.array(list(alive), dtype=int)
+            neg_w = _mine_hard_negatives_from_pool(pos_w, alive_arr, N_NEG_RERANKER)
+            neg_w["sample_weight"] = weight
+            window_dfs.append(pd.concat([pos_w, neg_w], ignore_index=True))
 
-    all_rows = pd.concat([pos, neg], ignore_index=True)
+        if not window_dfs:
+            raise ValueError("All reranker sliding windows were empty")
+        all_rows = pd.concat(window_dfs, ignore_index=True)
+        print(f"  {len(all_rows):,} total rows across {len(window_dfs)} windows")
 
     # ── join features ─────────────────────────────────────────────────────────
     all_rows = all_rows.merge(user_sel, on="customer_id", how="left")
@@ -358,19 +522,7 @@ def build_reranker_dataset(
     all_rows["user_ever_bought_article"] = ever_bought_list
     all_rows = all_rows.drop(columns=["seq_dates"])
 
-    # fill any remaining NaN numerics
-    num_cols = [
-        "customer_id_enc", "age", "agebucket_enc", "clubmemberstatus_enc",
-        "fashionnewsfrequency_enc", "user_total_purchases", "user_avg_norm_price",
-        "user_purchase_freq", "user_recency_days", "user_preferred_channel",
-        "user_preferred_prodtype", "user_preferred_indexgroup", "user_preferred_colour",
-        "producttype_enc", "indexgroup_enc", "colourgroup_enc", "garmentgroup_enc",
-        "article_avg_norm_price", "log_global_sales", "article_channel1_ratio",
-    ]
-    for col in num_cols:
-        if col in all_rows.columns:
-            all_rows[col] = all_rows[col].fillna(0)
-
+    _fill_num_cols(all_rows)
     print(f"  {len(all_rows):,} total reranker rows ({split_name})")
     return all_rows
 
